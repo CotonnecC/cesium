@@ -45,6 +45,7 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
     CryptoAbstractService.prototype.constants = {
       crypto_sign_BYTES: 64,
       crypto_secretbox_NONCEBYTES: 24,
+      crypto_box_MACBYTES: 16,
       SEED_LENGTH: 32, // Length of the key
       SCRYPT_PARAMS:{
         N: 4096,
@@ -124,10 +125,10 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
       this.util.encode_utf8 = function (s) {
         return that.nacl.encode_utf8(s);
       };
-      this.util.encode_base58 = function (a) {
+      this.util.encode_base58 = function (a) { // TODO : move to abstract factory
         return that.base58.encode(a);
       };
-      this.util.decode_base58 = function (a) {
+      this.util.decode_base58 = function (a) { // TODO : move to abstract factory
         var i;
         a = that.base58.decode(a);
         var b = new Uint8Array(a.length);
@@ -137,8 +138,8 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
       this.util.decode_base64 = function (a) {
         return that.base64.decode(a);
       };
-      this.util.encode_base64 = function () {
-        return that.base64.encode(arguments);
+      this.util.encode_base64 = function (b) {
+        return that.base64.encode(b);
       };
 
       this.util.hash_sha256 = function (message) {
@@ -177,7 +178,7 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
       /**
        * Encrypt a message, from a key pair
        */
-      this.box = function (message, nonce, recipientPk, senderSk) {
+      this.box = function(message, nonce, recipientPk, senderSk) {
         return $q(function (resolve, reject) {
           if (!message) {
             resolve(message);
@@ -192,6 +193,7 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
           try {
             var ciphertextBin = that.nacl.crypto_box(messageBin, nonce, recipientPk, senderSk);
             var ciphertext = that.util.encode_base64(ciphertextBin);
+
             //console.debug('Encrypted message: ' + ciphertext);
             resolve(ciphertext);
           }
@@ -350,7 +352,6 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
 
       // libraries handlers
       this.nacl = null; // the cordova plugin
-      this.nacl_js= null; // the full JS lib (need for random values)
       this.base58= null;
       this.sha256= null;
       var that = this;
@@ -373,18 +374,19 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
         for (i = 0; i < a.length; i++) b[i] = a[i];
         return b;
       };
+      this.util.decode_base64 = function (a) {
+        return that.nacl.from_base64(a);
+      };
+      this.util.encode_base64 = function (b) {
+        return that.nacl.to_base64(b);
+      };
       this.util.hash_sha256 = function(message) {
         return $q.when(that.sha256(message).toUpperCase());
       };
       this.util.random_nonce = function() {
-        if (that.crypto && that.crypto.getRandomValues) {
-          var nonce = new Uint8Array(that.constants.crypto_secretbox_NONCEBYTES);
-          that.crypto.getRandomValues(nonce);
-          return $q.when(nonce);
-        }
-        else {
-          return $q.when(that.nacl_js.crypto_box_random_nonce());
-        }
+        var nonce = new Uint8Array(that.constants.crypto_secretbox_NONCEBYTES);
+        that.crypto.getRandomValues(nonce);
+        return $q.when(nonce);
       };
 
       /**
@@ -402,6 +404,7 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
           that.constants.SEED_LENGTH,
           function (err, seed) {
             if (err) { deferred.reject(err); return;}
+
             that.nacl.crypto_sign_seed_keypair(seed, function (err, signKeypair) {
               if (err) { deferred.reject(err); return;}
               var result = {
@@ -509,16 +512,15 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
           return $q.reject('No message');
         }
         var deferred = $q.defer();
+
         var messageBin = that.nacl.from_string(message);
         if (typeof recipientPk === "string") {
           recipientPk = that.util.decode_base58(recipientPk);
         }
 
-        //console.debug('Original message: ' + message);
-
         that.nacl.crypto_box_easy(messageBin, nonce, recipientPk, senderSk, function(err, ciphertextBin) {
           if (err) { deferred.reject(err); return;}
-          var ciphertext = that.nacl.to_base64(ciphertextBin);
+          var ciphertext = that.util.encode_base64(ciphertextBin);
           //console.debug('Encrypted message: ' + ciphertext);
           deferred.resolve(ciphertext);
         });
@@ -537,6 +539,12 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
         var ciphertextBin = that.nacl.from_base64(cypherText);
         if (typeof senderPk === "string") {
           senderPk = that.util.decode_base58(senderPk);
+        }
+
+        // Avoid crash if content has not the minimal length - Fix #346
+        if (ciphertextBin.length < that.constants.crypto_box_MACBYTES) {
+          deferred.reject('Invalid cypher content length');
+          return;
         }
 
         that.nacl.crypto_box_open_easy(ciphertextBin, nonce, senderPk, recipientSk, function(err, message) {
@@ -558,10 +566,9 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
         else {
           that.nacl = window.plugins.MiniSodium;
           var loadedLib = 0;
-          var expectedLoadedLib = 2;
           var checkAllLibLoaded = function() {
             loadedLib++;
-            if (loadedLib == expectedLoadedLib) {
+            if (loadedLib == 2) {
               that.loaded = true;
               deferred.resolve();
             }
@@ -574,14 +581,6 @@ angular.module('cesium.crypto.services', ['ngResource', 'cesium.device.services'
             that.sha256 = lib;
             checkAllLibLoaded();
           });
-          if (!that.crypto || !that.crypto.getRandomValues) {
-            console.debug('[crypto] Web Crypto API (window.crypto) NOT exists with getRandomValues. Will load nacl_factory');
-            expectedLoadedLib++;
-            that.async_load_nacl_js(function(lib) {
-              that.nacl_js = lib;
-              checkAllLibLoaded();
-            });
-          }
         }
 
         return deferred.promise;
